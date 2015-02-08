@@ -27,12 +27,15 @@
     [io.netty.handler.ssl SslContext]
     [io.netty.handler.ssl.util
      SelfSignedCertificate InsecureTrustManagerFactory]
+    [io.netty.handler.timeout WriteTimeoutHandler
+     WriteTimeoutException]
     [io.netty.util ResourceLeakDetector
      ResourceLeakDetector$Level]
     [io.netty.util.concurrent GenericFutureListener Future]
     [java.net SocketAddress InetSocketAddress]
     [java.io InputStream]
     [java.nio ByteBuffer]
+    [java.util.concurrent TimeUnit]
     [io.netty.util.internal.logging
      InternalLoggerFactory
      Log4JLoggerFactory
@@ -140,16 +143,31 @@
 (defn to-byte-buf-stream [x chunk-size]
   (bs/convert x (bs/stream-of ByteBuf) {:chunk-size chunk-size}))
 
-(defn wrap-future [^Future f]
-  (when f
-    (if (.isSuccess f)
-      (d/success-deferred true)
-      (let [d (d/deferred)]
-        (.addListener f
-          (reify GenericFutureListener
-            (operationComplete [_ _]
-              (d/success! d (.isSuccess f)))))
-        d))))
+(defn wrap-future
+  ([^Future f]
+    (wrap-future f false))
+  ([^Future f timeout-value]
+    (when f
+      (if (.isSuccess f)
+        (d/success-deferred true)
+        (let [d (d/deferred)]
+          (.addListener f
+            (reify GenericFutureListener
+              (operationComplete [_ _]
+                (cond
+                  (.isSuccess f)
+                    (d/success! d true)
+                  (.isCancelled f)
+                    (d/success! d false)
+                  (some? (.cause f))
+                    (try
+                      (throw (.cause f))
+                      (catch WriteTimeoutException ex
+                        (d/success! d timeout-value))
+                      (catch Throwable ex
+                        (log/error ex "Connect error.")
+                        (d/success! d false)))))))
+          d)))))
 
 ;;;
 
@@ -217,6 +235,7 @@
         d))))
 
 ;;;
+(def ^:const write-timeout-handler-name "writeTimeout")
 
 (manifold/def-sink ChannelSink [coerce-fn downstream? ch]
   (close [this]
@@ -232,6 +251,21 @@
   (isSynchronous [_]
     false)
   (put [this msg blocking?]
+    (.put this msg blocking? nil false))
+  (put [this msg blocking? timeout timeout-value]
+    (let [timeout-handler (.. ^Channel ch (pipeline) (get write-timeout-handler-name))]
+      (if timeout
+        (do
+          (when-not timeout-handler
+            (.. ^Channel ch
+                (pipeline)
+                (addLast write-timeout-handler-name
+                         (WriteTimeoutHandler. (long timeout) (TimeUnit/MILLISECONDS))))))
+        (do
+          (when timeout-handler
+            (.. ^Channel ch
+                (pipeline)
+                (remove write-timeout-handler-name))))))
     (let [msg (try
                 (coerce-fn msg)
                 (catch Exception e
@@ -241,12 +275,10 @@
                       " into binary representation"))
                   (close ch)))
           ^ChannelFuture f (write-and-flush ch msg)
-          d (wrap-future f)]
+          d (wrap-future f timeout-value)]
       (if blocking?
         @d
-        d)))
-  (put [this msg blocking? timeout timeout-value]
-    (.put this msg blocking?)))
+        d))))
 
 (defn sink
   ([ch]
